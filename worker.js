@@ -1,7 +1,6 @@
 /**
  * Throne subscription bridge — KV-only edition.
- * Cloudflare binding: SUBSCRIPTIONS_KV (Workers KV namespace).
- * Optional secrets: REFRESH_TOKEN, GITHUB_TOKEN.
+ * Binding: SUBSCRIPTIONS_KV. Optional secrets: REFRESH_TOKEN, GITHUB_TOKEN.
  * No Durable Objects, cron, external packages or stored credentials required.
  */
 const REPOSITORY = "igareck/vpn-configs-for-russia";
@@ -13,6 +12,7 @@ const RETRY_MS = 5 * 60 * 1000;
 const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES = 25 * 1024 * 1024;
 const HEAD_KEY = "bridge:v3:head";
+const DEDUP_VERSION = 2;
 const SCOPES = ["all", "black", "white-cidr", "white-sni"];
 const PATTERNS = {
   all: /^(?:BLACK_.*|WHITE-(?:CIDR|SNI)-.*|Vless-Reality-White-Lists-Rus-Mobile(?:-\d+)?)\.txt$/i,
@@ -45,7 +45,7 @@ function validSha(sha) {
   return typeof sha === "string" && /^[a-f0-9]{40}$/i.test(sha);
 }
 function snapshotKey(sha) {
-  return `bridge:v3:snapshot:${sha}`;
+  return `bridge:v3:snapshot:${sha}:dedup${DEDUP_VERSION}`;
 }
 function toBase64Utf8(text) {
   const bytes = encoder.encode(text);
@@ -56,9 +56,131 @@ function toBase64Utf8(text) {
   return btoa(binary);
 }
 
+// A profile's display name is not its connection identity. Keep the original
+// URI for the client, but compare its connection settings without the fragment.
+// Never collapse profiles merely because they share an IP, hostname or port.
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableJson(value[key])]));
+  }
+  return value;
+}
+function decodeBase64(value) {
+  const clean = value.replace(/-/g, "+").replace(/_/g, "/").replace(/=+$/, "");
+  if (!clean || !/^[A-Za-z0-9+/]+$/.test(clean) || clean.length % 4 === 1) return null;
+  try {
+    const binary = atob(clean.padEnd(Math.ceil(clean.length / 4) * 4, "="));
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Uint8Array.from(binary, (char) => char.charCodeAt(0))
+    );
+  } catch {
+    return null;
+  }
+}
+function canonicalUrl(uri) {
+  const url = new URL(uri);
+  if (!url.hostname) throw new Error("Missing proxy hostname");
+  // Preserve all transport, TLS, fingerprint, SNI, path and other settings.
+  // Only query-key ordering is normalized; repeated keys keep their order.
+  const params = [...url.searchParams];
+  params.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  return [
+    url.protocol.toLowerCase(),
+    decodeURIComponent(url.username),
+    decodeURIComponent(url.password),
+    url.hostname.toLowerCase(),
+    url.port,
+    url.pathname,
+    params,
+  ];
+}
+function canonicalIdentity(uri) {
+  const match = /^([a-z][a-z0-9+.-]*):\/\//i.exec(uri);
+  if (!match) return `raw:${uri}`;
+  const scheme = match[1].toLowerCase();
+  try {
+    if (scheme === "vmess") {
+      const payload = uri.slice(match[0].length).split("#", 1)[0];
+      const decoded = decodeBase64(payload);
+      if (decoded !== null) {
+        const config = JSON.parse(decoded);
+        if (config && typeof config === "object" && !Array.isArray(config)) {
+          const connection = { ...config };
+          // These are display-only fields in standard VMess JSON subscriptions.
+          for (const key of ["ps", "remarks", "remark", "name"]) delete connection[key];
+          return `vmess-json:${JSON.stringify(stableJson(connection))}`;
+        }
+      }
+    }
+    if (scheme === "ss") {
+      let normalized = uri;
+      // Legacy SS encodes the entire method:password@host:port authority.
+      const authority = /^ss:\/\/([^/?#]+)(.*)$/i.exec(uri);
+      if (authority && !authority[1].includes("@")) {
+        const decoded = decodeBase64(authority[1]);
+        if (decoded && decoded.includes("@")) normalized = `ss://${decoded}${authority[2]}`;
+      }
+      const parts = canonicalUrl(normalized);
+      // SIP002 may encode just the method:password userinfo in Base64.
+      if (!parts[2]) {
+        const decoded = decodeBase64(parts[1]);
+        if (decoded && decoded.includes(":")) {
+          const separator = decoded.indexOf(":");
+          parts[1] = decoded.slice(0, separator).toLowerCase();
+          parts[2] = decoded.slice(separator + 1);
+        }
+      }
+      // The cipher name is case-insensitive; the password is not.
+      parts[1] = parts[1].toLowerCase();
+      return `ss:${JSON.stringify(parts)}`;
+    }
+    return `url:${JSON.stringify(canonicalUrl(uri))}`;
+  } catch {
+    // Unknown or malformed encodings are not guessed at. Exact duplicates
+    // still collapse, and a trailing display fragment is safe to ignore.
+    return `${scheme}:${uri.slice(match[0].length).split("#", 1)[0]}`;
+  }
+}
+function aggregateProfiles(sources) {
+  const profiles = new Map();
+  const sourceStats = [];
+  let totalProfiles = 0;
+  for (const { path, proxies } of sources) {
+    let mask = 1;
+    if (PATTERNS.black.test(path)) mask |= 2;
+    if (PATTERNS["white-cidr"].test(path)) mask |= 4;
+    if (PATTERNS["white-sni"].test(path)) mask |= 8;
+    sourceStats.push({ path, count: proxies.length });
+    for (const uri of proxies) {
+      totalProfiles++;
+      const key = canonicalIdentity(uri);
+      const existing = profiles.get(key);
+      if (existing) {
+        existing.mask |= mask;
+      } else {
+        profiles.set(key, { uri, mask });
+      }
+    }
+  }
+  const counts = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
+  for (const profile of profiles.values()) {
+    for (let i = 0; i < SCOPES.length; i++) {
+      if (profile.mask & (1 << i)) counts[SCOPES[i]]++;
+    }
+  }
+  return {
+    profiles: [...profiles.values()].map(({ uri, mask }) => [uri, mask]),
+    counts,
+    sourceStats,
+    totalProfiles,
+    duplicatesRemoved: totalProfiles - profiles.size,
+  };
+}
+
 async function githubJson(path, env) {
   const requestHeaders = {
-    "user-agent": "throne-subscription-bridge/3.0",
+    "user-agent": "throne-subscription-bridge/3.1",
     accept: "application/vnd.github+json",
   };
   if (env.GITHUB_TOKEN) requestHeaders.authorization = `Bearer ${env.GITHUB_TOKEN}`;
@@ -78,8 +200,6 @@ async function latestCommit(env) {
   return { sha: data.sha, tree: data.commit.tree.sha };
 }
 async function discoverSources(treeSha, env) {
-  // The immutable root tree is more reliable than parsing changing README markup.
-  // It also automatically includes newly added standard root TXT files.
   const data = await githubJson(`/git/trees/${treeSha}`, env);
   if (data.truncated || !Array.isArray(data.tree)) {
     throw new Error("GitHub returned an incomplete repository tree");
@@ -96,7 +216,7 @@ async function discoverSources(treeSha, env) {
 async function loadSource(path, sha) {
   const url = `${RAW}${sha}/${encodeURIComponent(path)}`;
   const response = await fetch(url, {
-    headers: { "user-agent": "throne-subscription-bridge/3.0" },
+    headers: { "user-agent": "throne-subscription-bridge/3.1" },
     signal: AbortSignal.timeout(20000),
     cache: "no-store",
   });
@@ -117,34 +237,22 @@ async function buildSnapshot(commit, env) {
   const errors = results
     .filter((result) => result.status === "rejected")
     .map((result) => errorText(result.reason));
-  // Never publish a partially downloaded or empty aggregate.
   if (errors.length) throw new Error(`Source download failed: ${errors.join("; ")}`);
-  const profiles = new Map();
-  const counts = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
-  const sourceStats = [];
-  for (const result of results) {
-    if (result.status !== "fulfilled") continue;
-    const { path, proxies } = result.value;
-    let mask = 1;
-    if (PATTERNS.black.test(path)) mask |= 2;
-    if (PATTERNS["white-cidr"].test(path)) mask |= 4;
-    if (PATTERNS["white-sni"].test(path)) mask |= 8;
-    sourceStats.push({ path, count: proxies.length });
-    for (const uri of proxies) profiles.set(uri, (profiles.get(uri) || 0) | mask);
-  }
-  for (const mask of profiles.values()) {
-    for (let i = 0; i < SCOPES.length; i++) if (mask & (1 << i)) counts[SCOPES[i]]++;
-  }
-  if (SCOPES.some((scope) => counts[scope] === 0)) {
+  const loaded = results.filter((result) => result.status === "fulfilled").map((result) => result.value);
+  const aggregate = aggregateProfiles(loaded);
+  if (SCOPES.some((scope) => aggregate.counts[scope] === 0)) {
     throw new Error("One or more subscription scopes are empty");
   }
   const snapshot = {
     schema: 3,
+    dedupVersion: DEDUP_VERSION,
     sha: commit.sha,
     generatedAt: new Date().toISOString(),
-    sources: sourceStats,
-    counts,
-    profiles: [...profiles],
+    sources: aggregate.sourceStats,
+    counts: aggregate.counts,
+    totalProfiles: aggregate.totalProfiles,
+    duplicatesRemoved: aggregate.duplicatesRemoved,
+    profiles: aggregate.profiles,
   };
   const serialized = JSON.stringify(snapshot);
   if (encoder.encode(serialized).byteLength > MAX_SNAPSHOT_BYTES) {
@@ -158,7 +266,7 @@ async function getHead(env) {
   return head?.schema === 3 ? head : null;
 }
 async function getSnapshot(env, key) {
-  if (!key || !/^bridge:v3:snapshot:[a-f0-9]{40}$/i.test(key)) return null;
+  if (!key || !/^bridge:v3:snapshot:[a-f0-9]{40}(?::dedup2)?$/i.test(key)) return null;
   const snapshot = await env.SUBSCRIPTIONS_KV.get(key, { type: "json", cacheTtl: 60 });
   return snapshot?.schema === 3 && Array.isArray(snapshot.profiles) ? snapshot : null;
 }
@@ -171,32 +279,34 @@ async function readReady(env, head) {
   return null;
 }
 function isFresh(head, now = Date.now()) {
-  return head && Number.isFinite(head.nextCheckAt) && now < head.nextCheckAt;
+  return head?.dedupVersion === DEDUP_VERSION && Number.isFinite(head.nextCheckAt) && now < head.nextCheckAt;
 }
 async function saveHead(env, head) {
   await env.SUBSCRIPTIONS_KV.put(HEAD_KEY, JSON.stringify(head));
 }
-
 async function refresh(env, initialHead, force = false) {
-  // Re-read inside single-flight: another request in this isolate may have updated it.
   let head = await getHead(env) || initialHead;
   const ready = await readReady(env, head);
-  if (!force && ready && isFresh(head)) return { action: "fresh", head, snapshot: ready.snapshot };
+  if (!force && ready && ready.snapshot.dedupVersion === DEDUP_VERSION && isFresh(head)) {
+    return { action: "fresh", head, snapshot: ready.snapshot };
+  }
   const checkedAt = new Date().toISOString();
   try {
     const commit = await latestCommit(env);
-    if (ready && head.sha === commit.sha && ready.snapshot.sha === commit.sha) {
-      head = { ...head, checkedAt, nextCheckAt: Date.now() + CHECK_MS, lastCheckResult: "unchanged", lastError: null };
+    if (ready && head.sha === commit.sha && ready.snapshot.sha === commit.sha &&
+        ready.snapshot.dedupVersion === DEDUP_VERSION) {
+      head = { ...head, dedupVersion: DEDUP_VERSION, checkedAt, nextCheckAt: Date.now() + CHECK_MS, lastCheckResult: "unchanged", lastError: null };
       await saveHead(env, head);
       return { action: "unchanged", head, snapshot: ready.snapshot };
     }
     const { snapshot, serialized } = await buildSnapshot(commit, env);
     const key = snapshotKey(commit.sha);
-    // Immutable snapshot first, then the small pointer. A failed build cannot
-    // replace the previous working version. No cross-region KV transaction exists.
+    // Write the new version before switching the pointer. Old snapshots remain
+    // available for rollback; KV is eventually consistent, not transactional.
     await env.SUBSCRIPTIONS_KV.put(key, serialized);
     head = {
       schema: 3,
+      dedupVersion: DEDUP_VERSION,
       sha: commit.sha,
       snapshotKey: key,
       previousKey: head?.snapshotKey !== key ? head?.snapshotKey || null : head?.previousKey || null,
@@ -206,6 +316,7 @@ async function refresh(env, initialHead, force = false) {
       lastCheckResult: ready ? "updated" : "initialized",
       lastError: null,
       counts: snapshot.counts,
+      duplicatesRemoved: snapshot.duplicatesRemoved,
     };
     await saveHead(env, head);
     return { action: head.lastCheckResult, head, snapshot };
@@ -219,7 +330,6 @@ async function refresh(env, initialHead, force = false) {
       lastCheckResult: "error",
       lastError: message,
     };
-    // A failed metadata write must not turn a usable stale cache into a 502.
     try { await saveHead(env, failedHead); } catch { /* Keep the old snapshot. */ }
     return { action: "stale", head: failedHead, snapshot: ready.snapshot };
   }
@@ -227,7 +337,9 @@ async function refresh(env, initialHead, force = false) {
 async function ensureReady(env, force = false) {
   const head = await getHead(env);
   const ready = await readReady(env, head);
-  if (!force && ready && isFresh(head)) return { action: "fresh", head, snapshot: ready.snapshot };
+  if (!force && ready && ready.snapshot.dedupVersion === DEDUP_VERSION && isFresh(head)) {
+    return { action: "fresh", head, snapshot: ready.snapshot };
+  }
   if (!pendingRefresh) {
     pendingRefresh = refresh(env, head, force).finally(() => { pendingRefresh = null; });
   }
@@ -239,8 +351,13 @@ async function ensureReady(env, force = false) {
   }
 }
 function renderSubscription(snapshot, scope, format) {
+  // Also deduplicate legacy cached snapshots while their replacement is built.
+  const aggregate = snapshot.dedupVersion === DEDUP_VERSION
+    ? null
+    : aggregateProfiles([{ path: "BLACK_legacy.txt", proxies: snapshot.profiles.map((entry) => entry[0]) }]);
+  const profiles = aggregate ? aggregate.profiles.map((entry) => [entry[0], 1]) : snapshot.profiles;
   const bit = 1 << SCOPES.indexOf(scope);
-  const lines = snapshot.profiles.filter((entry) => entry[1] & bit).map((entry) => entry[0]);
+  const lines = profiles.filter((entry) => entry[1] & bit).map((entry) => entry[0]);
   const body = `${lines.join("\n")}\n`;
   if (format === "base64") return toBase64Utf8(body);
   return [
@@ -265,7 +382,6 @@ async function authorized(request, env) {
   for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
   return diff === 0;
 }
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -290,22 +406,26 @@ export default {
       if (path === "/status") {
         const head = await getHead(env);
         const ready = await readReady(env, head);
+        const snapshot = ready?.snapshot;
         return jsonResponse({
           ok: Boolean(ready), scope,
-          sha: ready?.snapshot.sha || null,
-          generatedAt: ready?.snapshot.generatedAt || null,
+          sha: snapshot?.sha || null,
+          generatedAt: snapshot?.generatedAt || null,
           checkedAt: head?.checkedAt || null,
           nextCheckAt: head?.nextCheckAt ? new Date(head.nextCheckAt).toISOString() : null,
           lastCheckResult: head?.lastCheckResult || null,
           lastError: head?.lastError || null,
           checkIntervalMinutes: 15,
-          uniqueProxies: ready?.snapshot.counts?.[scope] || 0,
-          sources: ready?.snapshot.sources || [],
+          dedupVersion: snapshot?.dedupVersion || 1,
+          uniqueProxies: snapshot?.counts?.[scope] || 0,
+          totalProfiles: snapshot?.totalProfiles || 0,
+          duplicatesRemoved: snapshot?.duplicatesRemoved || 0,
+          sources: snapshot?.sources || [],
           fallback: ready?.fallback || false,
         });
       }
       const result = await ensureReady(env, path === "/refresh");
-      if (path === "/refresh") return jsonResponse({ ok: true, action: result.action, sha: result.snapshot.sha, generatedAt: result.snapshot.generatedAt });
+      if (path === "/refresh") return jsonResponse({ ok: true, action: result.action, sha: result.snapshot.sha, generatedAt: result.snapshot.generatedAt, duplicatesRemoved: result.snapshot.duplicatesRemoved || 0 });
       return new Response(renderSubscription(result.snapshot, scope, format), {
         headers: headers({
           "x-subscription-sha": result.snapshot.sha,
