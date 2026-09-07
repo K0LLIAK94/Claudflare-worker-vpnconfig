@@ -70,13 +70,18 @@ function decodeBase64(value) {
   if (!clean || !/^[A-Za-z0-9+/]+$/.test(clean) || clean.length % 4 === 1) return null;
   try {
     const binary = atob(clean.padEnd(Math.ceil(clean.length / 4) * 4, "="));
-    return new TextDecoder("utf-8", { fatal: true }).decode(
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
       Uint8Array.from(binary, (char) => char.charCodeAt(0))
     );
   } catch {
     return null;
   }
 }
+/**
+ * Keep the six connection fields as strings and the query as an array of pairs.
+ * This prevents TypeScript from inferring a union of strings and query arrays.
+ * @returns {[string, string, string, string, string, string, [string, string][]]}
+ */
 function canonicalUrl(uri) {
   const url = new URL(uri);
   if (!url.hostname) throw new Error("Missing proxy hostname");
