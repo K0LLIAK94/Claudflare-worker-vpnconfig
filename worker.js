@@ -1,56 +1,33 @@
 /**
- * Throne subscription bridge for Cloudflare Workers.
- *
- * Bindings required:
- *   SUBSCRIPTIONS_KV  -> Cloudflare KV namespace
- *   UPDATE_LOCK       -> Durable Object namespace using class UpdateLock
- *
- * Refresh strategy:
- *   - VPN clients read the ready subscription from KV.
- *   - GitHub is checked at most once every 15 minutes.
- *   - The upstream main-branch commit SHA is compared with the cached SHA.
- *   - If SHA is unchanged, no TXT feeds are downloaded.
- *   - If SHA changed, all supported feeds are downloaded once and all scopes
- *     are rebuilt atomically from the same upstream snapshot.
- *   - If GitHub is unavailable, the last successful subscription stays usable.
+ * Throne subscription bridge — KV-only edition.
+ * Cloudflare binding: SUBSCRIPTIONS_KV (Workers KV namespace).
+ * Optional secrets: REFRESH_TOKEN, GITHUB_TOKEN.
+ * No Durable Objects, cron, external packages or stored credentials required.
  */
-
 const REPOSITORY = "igareck/vpn-configs-for-russia";
 const BRANCH = "main";
-const RAW_BASE = `https://raw.githubusercontent.com/${REPOSITORY}/${BRANCH}/`;
-const README_URL = `${RAW_BASE}README.md`;
-const COMMIT_URL = `https://api.github.com/repos/${REPOSITORY}/commits/${BRANCH}`;
-
-const CHECK_INTERVAL_MS = 15 * 60 * 1000;
-const USER_AGENT = "throne-subscription-bridge/2.0";
-const META_KEY = "meta";
+const API = `https://api.github.com/repos/${REPOSITORY}`;
+const RAW = `https://raw.githubusercontent.com/${REPOSITORY}/`;
+const CHECK_MS = 15 * 60 * 1000;
+const RETRY_MS = 5 * 60 * 1000;
+const MAX_SOURCE_BYTES = 8 * 1024 * 1024;
+const MAX_SNAPSHOT_BYTES = 25 * 1024 * 1024;
+const HEAD_KEY = "bridge:v3:head";
 const SCOPES = ["all", "black", "white-cidr", "white-sni"];
-
-const FALLBACK_SOURCES = [
-  "BLACK_SS+All_RUS.txt",
-  "BLACK_SS_WEAK_DPI_RUS.txt",
-  "BLACK_VLESS_RUS.txt",
-  "BLACK_VLESS_RUS_mobile.txt",
-  "Vless-Reality-White-Lists-Rus-Mobile.txt",
-  "WHITE-CIDR-RU-all.txt",
-  "WHITE-CIDR-RU-checked.txt",
-  "WHITE-SNI-RU-all.txt",
-];
-
-const PROXY_URI = /^(?!https?:\/\/)[a-z][a-z0-9+.-]*:\/\/\S+$/i;
-
-const SCOPE_PATTERNS = {
-  all: /^(?:BLACK_.*|WHITE-(?:CIDR|SNI)-.*|Vless-Reality-White-Lists-Rus-Mobile)\.txt$/i,
+const PATTERNS = {
+  all: /^(?:BLACK_.*|WHITE-(?:CIDR|SNI)-.*|Vless-Reality-White-Lists-Rus-Mobile(?:-\d+)?)\.txt$/i,
   black: /^BLACK_.*\.txt$/i,
   "white-cidr": /^WHITE-CIDR-.*\.txt$/i,
   "white-sni": /^WHITE-SNI-.*\.txt$/i,
 };
+const PROXY_URI = /^(?!https?:\/\/)[a-z][a-z0-9+.-]*:\/\/\S+$/i;
+const encoder = new TextEncoder();
+let pendingRefresh = null; // Single-flight within this Worker isolate only.
 
-function subscriptionKey(scope, format) {
-  return `subscription:${scope}:${format}`;
+function errorText(error) {
+  return error instanceof Error ? error.message : String(error);
 }
-
-function subscriptionHeaders(extra = {}) {
+function headers(extra = {}) {
   return {
     "content-type": "text/plain; charset=utf-8",
     "cache-control": "no-store, max-age=0",
@@ -58,417 +35,284 @@ function subscriptionHeaders(extra = {}) {
     ...extra,
   };
 }
-
-function jsonHeaders() {
-  return {
-    "cache-control": "no-store, max-age=0",
-    "access-control-allow-origin": "*",
-  };
+function responseError(message, status = 502) {
+  return new Response(message, { status, headers: headers() });
 }
-
+function jsonResponse(data, status = 200) {
+  return Response.json(data, { status, headers: headers() });
+}
+function validSha(sha) {
+  return typeof sha === "string" && /^[a-f0-9]{40}$/i.test(sha);
+}
+function snapshotKey(sha) {
+  return `bridge:v3:snapshot:${sha}`;
+}
 function toBase64Utf8(text) {
-  const bytes = new TextEncoder().encode(text);
+  const bytes = encoder.encode(text);
   let binary = "";
-
-  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   }
-
   return btoa(binary);
 }
 
-function normalizeError(error) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function validateScope(scope) {
-  return Object.prototype.hasOwnProperty.call(SCOPE_PATTERNS, scope);
-}
-
-async function fetchLatestCommitSha() {
-  const response = await fetch(COMMIT_URL, {
-    headers: {
-      "user-agent": USER_AGENT,
-      accept: "application/vnd.github+json",
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`GitHub commit check: HTTP ${response.status}`);
-  }
-
-  const data = await response.json();
-  if (!data || typeof data.sha !== "string" || !data.sha) {
-    throw new Error("GitHub commit check returned no SHA");
-  }
-
-  return data.sha;
-}
-
-async function discoverSources() {
-  try {
-    const response = await fetch(README_URL, {
-      headers: { "user-agent": USER_AGENT },
-    });
-
-    if (!response.ok) {
-      throw new Error(`README: HTTP ${response.status}`);
-    }
-
-    const readme = await response.text();
-    const listedPaths = new Set();
-    const link = /https?:\/\/(?:raw\.githack\.com|raw\.githubusercontent\.com)\/igareck\/vpn-configs-for-russia\/(?:main|refs\/heads\/main)\/([^\s)"']+\.txt)/gi;
-
-    let match;
-    while ((match = link.exec(readme)) !== null) {
-      let path;
-      try {
-        path = decodeURIComponent(match[1]).split("?")[0];
-      } catch {
-        continue;
-      }
-
-      if (!path.includes("/") && SCOPE_PATTERNS.all.test(path)) {
-        listedPaths.add(path);
-      }
-    }
-
-    if (listedPaths.size > 0) {
-      return [...listedPaths];
-    }
-  } catch {
-    // Fallback keeps the last known standard source set available when README
-    // discovery fails temporarily.
-  }
-
-  return [...FALLBACK_SOURCES];
-}
-
-async function loadSource(path) {
-  const url = `${RAW_BASE}${path.split("/").map(encodeURIComponent).join("/")}`;
-  const response = await fetch(url, {
-    headers: { "user-agent": USER_AGENT },
-  });
-
-  if (!response.ok) {
-    throw new Error(`${path}: HTTP ${response.status}`);
-  }
-
-  const proxies = (await response.text())
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => PROXY_URI.test(line));
-
-  return { path, proxies };
-}
-
-async function buildAllSubscriptions(commitSha) {
-  const sources = await discoverSources();
-  const results = await Promise.allSettled(sources.map(loadSource));
-  const loaded = [];
-  const errors = [];
-
-  for (const result of results) {
-    if (result.status === "fulfilled") {
-      loaded.push(result.value);
-    } else {
-      errors.push(normalizeError(result.reason));
-    }
-  }
-
-  if (loaded.length === 0) {
-    throw new Error(`All upstream feeds are unavailable: ${errors.join("; ")}`);
-  }
-
-  const generatedAt = new Date().toISOString();
-  const subscriptions = {};
-  const scopeStats = {};
-
-  for (const scope of SCOPES) {
-    const pattern = SCOPE_PATTERNS[scope];
-    const unique = new Set();
-    const usedSources = [];
-
-    for (const source of loaded) {
-      if (!pattern.test(source.path)) continue;
-      usedSources.push(source.path);
-      for (const proxy of source.proxies) unique.add(proxy);
-    }
-
-    if (unique.size === 0) {
-      throw new Error(`Scope ${scope} produced zero proxy profiles`);
-    }
-
-    const proxyBody = `${[...unique].join("\n")}\n`;
-    const headerLines = [
-      `# profile-title: Universal | Igareck ${scope} aggregate`,
-      "# profile-update-interval: 60",
-      `# Generated: ${generatedAt}`,
-      `# Upstream commit: ${commitSha}`,
-      `# Unique proxies: ${unique.size}`,
-    ];
-
-    if (errors.length > 0) {
-      headerLines.push(`# Unavailable source(s): ${errors.join("; ")}`);
-    }
-
-    subscriptions[scope] = {
-      plain: `${headerLines.join("\n")}\n${proxyBody}`,
-      base64: toBase64Utf8(proxyBody),
-    };
-
-    scopeStats[scope] = {
-      uniqueProxies: unique.size,
-      sources: usedSources,
-    };
-  }
-
-  return {
-    subscriptions,
-    scopeStats,
-    sources,
-    errors,
-    generatedAt,
+async function githubJson(path, env) {
+  const requestHeaders = {
+    "user-agent": "throne-subscription-bridge/3.0",
+    accept: "application/vnd.github+json",
   };
-}
-
-async function getMeta(env) {
-  return (await env.SUBSCRIPTIONS_KV.get(META_KEY, "json")) || null;
-}
-
-async function hasCachedSubscription(env, scope, format) {
-  return (await env.SUBSCRIPTIONS_KV.get(subscriptionKey(scope, format))) !== null;
-}
-
-function checkIsFresh(meta, now = Date.now()) {
-  if (!meta || !meta.lastCheckedAt) return false;
-  const checkedAt = Date.parse(meta.lastCheckedAt);
-  return Number.isFinite(checkedAt) && now - checkedAt < CHECK_INTERVAL_MS;
-}
-
-async function refreshThroughLock(env, force = false) {
-  const id = env.UPDATE_LOCK.idFromName("global-subscription-refresh");
-  const stub = env.UPDATE_LOCK.get(id);
-  const url = force ? "https://lock.internal/refresh?force=1" : "https://lock.internal/refresh";
-  const response = await stub.fetch(url);
-
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-
+  if (env.GITHUB_TOKEN) requestHeaders.authorization = `Bearer ${env.GITHUB_TOKEN}`;
+  const response = await fetch(`${API}${path}`, {
+    headers: requestHeaders,
+    signal: AbortSignal.timeout(15000),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`GitHub API: HTTP ${response.status}`);
   return response.json();
 }
-
-async function ensureSubscription(env, scope, format) {
-  const meta = await getMeta(env);
-  const cached = await hasCachedSubscription(env, scope, format);
-
-  if (cached && checkIsFresh(meta)) {
-    return { meta, refresh: null };
+async function latestCommit(env) {
+  const data = await githubJson(`/commits/${BRANCH}`, env);
+  if (!validSha(data.sha) || !validSha(data.commit?.tree?.sha)) {
+    throw new Error("GitHub returned an invalid commit or tree SHA");
   }
+  return { sha: data.sha, tree: data.commit.tree.sha };
+}
+async function discoverSources(treeSha, env) {
+  // The immutable root tree is more reliable than parsing changing README markup.
+  // It also automatically includes newly added standard root TXT files.
+  const data = await githubJson(`/git/trees/${treeSha}`, env);
+  if (data.truncated || !Array.isArray(data.tree)) {
+    throw new Error("GitHub returned an incomplete repository tree");
+  }
+  const sources = data.tree
+    .filter((item) => item.type === "blob" && PATTERNS.all.test(item.path))
+    .map((item) => item.path)
+    .sort();
+  if (sources.length === 0 || sources.length > 64) {
+    throw new Error(`Unexpected number of standard TXT sources: ${sources.length}`);
+  }
+  return sources;
+}
+async function loadSource(path, sha) {
+  const url = `${RAW}${sha}/${encodeURIComponent(path)}`;
+  const response = await fetch(url, {
+    headers: { "user-agent": "throne-subscription-bridge/3.0" },
+    signal: AbortSignal.timeout(20000),
+    cache: "no-store",
+  });
+  if (!response.ok) throw new Error(`${path}: HTTP ${response.status}`);
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (declaredLength > MAX_SOURCE_BYTES) throw new Error(`${path}: source too large`);
+  const text = await response.text();
+  if (encoder.encode(text).byteLength > MAX_SOURCE_BYTES) {
+    throw new Error(`${path}: source too large`);
+  }
+  const proxies = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => PROXY_URI.test(line));
+  if (proxies.length === 0) throw new Error(`${path}: no supported proxy URI lines`);
+  return { path, proxies };
+}
+async function buildSnapshot(commit, env) {
+  const sources = await discoverSources(commit.tree, env);
+  const results = await Promise.allSettled(sources.map((path) => loadSource(path, commit.sha)));
+  const errors = results
+    .filter((result) => result.status === "rejected")
+    .map((result) => errorText(result.reason));
+  // Never publish a partially downloaded or empty aggregate.
+  if (errors.length) throw new Error(`Source download failed: ${errors.join("; ")}`);
+  const profiles = new Map();
+  const counts = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
+  const sourceStats = [];
+  for (const result of results) {
+    const { path, proxies } = result.value;
+    let mask = 1;
+    if (PATTERNS.black.test(path)) mask |= 2;
+    if (PATTERNS["white-cidr"].test(path)) mask |= 4;
+    if (PATTERNS["white-sni"].test(path)) mask |= 8;
+    sourceStats.push({ path, count: proxies.length });
+    for (const uri of proxies) profiles.set(uri, (profiles.get(uri) || 0) | mask);
+  }
+  for (const mask of profiles.values()) {
+    for (let i = 0; i < SCOPES.length; i++) if (mask & (1 << i)) counts[SCOPES[i]]++;
+  }
+  if (SCOPES.some((scope) => counts[scope] === 0)) {
+    throw new Error("One or more subscription scopes are empty");
+  }
+  const snapshot = {
+    schema: 3,
+    sha: commit.sha,
+    generatedAt: new Date().toISOString(),
+    sources: sourceStats,
+    counts,
+    profiles: [...profiles],
+  };
+  const serialized = JSON.stringify(snapshot);
+  if (encoder.encode(serialized).byteLength > MAX_SNAPSHOT_BYTES) {
+    throw new Error("Aggregate exceeds the 25 MiB KV value limit");
+  }
+  return { snapshot, serialized };
+}
 
+async function getHead(env) {
+  const head = await env.SUBSCRIPTIONS_KV.get(HEAD_KEY, { type: "json", cacheTtl: 60 });
+  return head?.schema === 3 ? head : null;
+}
+async function getSnapshot(env, key) {
+  if (!key || !/^bridge:v3:snapshot:[a-f0-9]{40}$/i.test(key)) return null;
+  const snapshot = await env.SUBSCRIPTIONS_KV.get(key, { type: "json", cacheTtl: 60 });
+  return snapshot?.schema === 3 && Array.isArray(snapshot.profiles) ? snapshot : null;
+}
+async function readReady(env, head) {
+  if (!head) return null;
+  const current = await getSnapshot(env, head.snapshotKey);
+  if (current) return { snapshot: current, head, fallback: false };
+  const previous = await getSnapshot(env, head.previousKey);
+  if (previous) return { snapshot: previous, head, fallback: true };
+  return null;
+}
+function isFresh(head, now = Date.now()) {
+  return head && Number.isFinite(head.nextCheckAt) && now < head.nextCheckAt;
+}
+async function saveHead(env, head) {
+  await env.SUBSCRIPTIONS_KV.put(HEAD_KEY, JSON.stringify(head));
+}
+
+async function refresh(env, initialHead, force = false) {
+  // Re-read inside single-flight: another request in this isolate may have updated it.
+  let head = await getHead(env) || initialHead;
+  const ready = await readReady(env, head);
+  if (!force && ready && isFresh(head)) return { action: "fresh", head, snapshot: ready.snapshot };
+  const checkedAt = new Date().toISOString();
   try {
-    const refresh = await refreshThroughLock(env, false);
-    return { meta: await getMeta(env), refresh };
-  } catch (error) {
-    // A stale but valid subscription is preferable to breaking every client
-    // during a transient GitHub/API outage.
-    if (cached) {
-      return {
-        meta: await getMeta(env),
-        refresh: { action: "stale-cache", error: normalizeError(error) },
-      };
+    const commit = await latestCommit(env);
+    if (ready && head.sha === commit.sha && ready.snapshot.sha === commit.sha) {
+      head = { ...head, checkedAt, nextCheckAt: Date.now() + CHECK_MS, lastCheckResult: "unchanged", lastError: null };
+      await saveHead(env, head);
+      return { action: "unchanged", head, snapshot: ready.snapshot };
     }
+    const { snapshot, serialized } = await buildSnapshot(commit, env);
+    const key = snapshotKey(commit.sha);
+    // Immutable snapshot first, then the small pointer. A failed build cannot
+    // replace the previous working version. No cross-region KV transaction exists.
+    await env.SUBSCRIPTIONS_KV.put(key, serialized);
+    head = {
+      schema: 3,
+      sha: commit.sha,
+      snapshotKey: key,
+      previousKey: head?.snapshotKey !== key ? head?.snapshotKey || null : head?.previousKey || null,
+      generatedAt: snapshot.generatedAt,
+      checkedAt,
+      nextCheckAt: Date.now() + CHECK_MS,
+      lastCheckResult: ready ? "updated" : "initialized",
+      lastError: null,
+      counts: snapshot.counts,
+    };
+    await saveHead(env, head);
+    return { action: head.lastCheckResult, head, snapshot };
+  } catch (error) {
+    const message = errorText(error);
+    if (!ready) throw error;
+    const failedHead = {
+      ...head,
+      checkedAt,
+      nextCheckAt: Date.now() + RETRY_MS,
+      lastCheckResult: "error",
+      lastError: message,
+    };
+    // A failed metadata write must not turn a usable stale cache into a 502.
+    try { await saveHead(env, failedHead); } catch { /* Keep the old snapshot. */ }
+    return { action: "stale", head: failedHead, snapshot: ready.snapshot };
+  }
+}
+async function ensureReady(env, force = false) {
+  const head = await getHead(env);
+  const ready = await readReady(env, head);
+  if (!force && ready && isFresh(head)) return { action: "fresh", head, snapshot: ready.snapshot };
+  if (!pendingRefresh) {
+    pendingRefresh = refresh(env, head, force).finally(() => { pendingRefresh = null; });
+  }
+  try {
+    return await pendingRefresh;
+  } catch (error) {
+    if (ready) return { action: "stale", head, snapshot: ready.snapshot, error: errorText(error) };
     throw error;
   }
 }
-
-export class UpdateLock {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-  }
-
-  async fetch(request) {
-    const url = new URL(request.url);
-    const force = url.searchParams.get("force") === "1";
-
-    return this.state.blockConcurrencyWhile(async () => {
-      const now = new Date();
-      const currentMeta = await getMeta(this.env);
-
-      if (!force && currentMeta && checkIsFresh(currentMeta, now.getTime())) {
-        return Response.json({
-          ok: true,
-          action: "recently-checked",
-          sha: currentMeta.sha || null,
-        });
-      }
-
-      try {
-        const latestSha = await fetchLatestCommitSha();
-
-        if (currentMeta?.sha === latestSha) {
-          const meta = {
-            ...currentMeta,
-            lastCheckedAt: now.toISOString(),
-            lastCheckResult: "unchanged",
-            lastError: null,
-          };
-          await this.env.SUBSCRIPTIONS_KV.put(META_KEY, JSON.stringify(meta));
-
-          return Response.json({
-            ok: true,
-            action: "unchanged",
-            sha: latestSha,
-          });
-        }
-
-        const build = await buildAllSubscriptions(latestSha);
-
-        const writes = [];
-        for (const scope of SCOPES) {
-          writes.push(
-            this.env.SUBSCRIPTIONS_KV.put(
-              subscriptionKey(scope, "plain"),
-              build.subscriptions[scope].plain,
-            ),
-            this.env.SUBSCRIPTIONS_KV.put(
-              subscriptionKey(scope, "base64"),
-              build.subscriptions[scope].base64,
-            ),
-          );
-        }
-        await Promise.all(writes);
-
-        const meta = {
-          sha: latestSha,
-          generatedAt: build.generatedAt,
-          lastCheckedAt: now.toISOString(),
-          lastSuccessfulUpdateAt: now.toISOString(),
-          lastCheckResult: currentMeta?.sha ? "updated" : "initialized",
-          lastError: null,
-          failedSources: build.errors,
-          discoveredSources: build.sources,
-          scopes: build.scopeStats,
-        };
-
-        // Metadata is written last. Readers therefore never see a new SHA before
-        // all subscription bodies have been stored successfully.
-        await this.env.SUBSCRIPTIONS_KV.put(META_KEY, JSON.stringify(meta));
-
-        return Response.json({
-          ok: true,
-          action: currentMeta?.sha ? "updated" : "initialized",
-          sha: latestSha,
-          generatedAt: build.generatedAt,
-        });
-      } catch (error) {
-        const message = normalizeError(error);
-        const failedMeta = {
-          ...(currentMeta || {}),
-          lastCheckedAt: now.toISOString(),
-          lastCheckResult: "error",
-          lastError: message,
-        };
-        await this.env.SUBSCRIPTIONS_KV.put(META_KEY, JSON.stringify(failedMeta));
-
-        return new Response(`Subscription refresh failed: ${message}`, {
-          status: 502,
-          headers: subscriptionHeaders(),
-        });
-      }
-    });
-  }
+function renderSubscription(snapshot, scope, format) {
+  const bit = 1 << SCOPES.indexOf(scope);
+  const lines = snapshot.profiles.filter((entry) => entry[1] & bit).map((entry) => entry[0]);
+  const body = `${lines.join("\n")}\n`;
+  if (format === "base64") return toBase64Utf8(body);
+  return [
+    `# profile-title: Universal | Igareck ${scope} aggregate`,
+    "# profile-update-interval: 60",
+    `# Generated: ${snapshot.generatedAt}`,
+    `# Upstream commit: ${snapshot.sha}`,
+    `# Unique proxies: ${lines.length}`,
+    body,
+  ].join("\n");
+}
+async function authorized(request, env) {
+  if (!env.REFRESH_TOKEN) return false;
+  const actual = request.headers.get("authorization") || "";
+  const expected = `Bearer ${env.REFRESH_TOKEN}`;
+  const [a, b] = await Promise.all([
+    crypto.subtle.digest("SHA-256", encoder.encode(actual)),
+    crypto.subtle.digest("SHA-256", encoder.encode(expected)),
+  ]);
+  const x = new Uint8Array(a), y = new Uint8Array(b);
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    if (request.method !== "GET") {
-      return new Response("Method not allowed", {
-        status: 405,
-        headers: { allow: "GET" },
-      });
+    const path = url.pathname;
+    if (!["/", "/subscription", "/status", "/refresh"].includes(path)) {
+      return responseError("Not found. Use /subscription or /status", 404);
     }
-
-    if (
-      url.pathname !== "/" &&
-      url.pathname !== "/subscription" &&
-      url.pathname !== "/status" &&
-      url.pathname !== "/refresh"
-    ) {
-      return new Response("Not found. Use /subscription, /status, or /refresh", {
-        status: 404,
-      });
+    if (!env.SUBSCRIPTIONS_KV) {
+      return responseError("Missing SUBSCRIPTIONS_KV binding. See README.md", 503);
     }
-
+    if (path === "/refresh") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: headers({ allow: "POST" }) });
+      if (!(await authorized(request, env))) return responseError("Unauthorized", 401);
+    } else if (request.method !== "GET") {
+      return new Response("Method not allowed", { status: 405, headers: headers({ allow: "GET" }) });
+    }
     const scope = url.searchParams.get("scope") || "all";
     const format = url.searchParams.get("format") || "base64";
-
-    if (!validateScope(scope)) {
-      return new Response("Unknown scope. Use all, black, white-cidr, or white-sni", {
-        status: 400,
-      });
-    }
-
-    if (format !== "base64" && format !== "plain") {
-      return new Response("Unknown format. Use base64 or plain", { status: 400 });
-    }
-
+    if (!Object.prototype.hasOwnProperty.call(PATTERNS, scope)) return responseError("Unknown scope", 400);
+    if (!["base64", "plain"].includes(format)) return responseError("Unknown format", 400);
     try {
-      if (url.pathname === "/status") {
-        const meta = await getMeta(env);
-        const cachedPlain = await hasCachedSubscription(env, scope, "plain");
-        const cachedBase64 = await hasCachedSubscription(env, scope, "base64");
-
-        return Response.json(
-          {
-            ok: Boolean(meta && (cachedPlain || cachedBase64)),
-            scope,
-            sha: meta?.sha || null,
-            generatedAt: meta?.generatedAt || null,
-            lastCheckedAt: meta?.lastCheckedAt || null,
-            lastSuccessfulUpdateAt: meta?.lastSuccessfulUpdateAt || null,
-            lastCheckResult: meta?.lastCheckResult || null,
-            lastError: meta?.lastError || null,
-            checkIntervalMinutes: CHECK_INTERVAL_MS / 60000,
-            cache: {
-              plain: cachedPlain,
-              base64: cachedBase64,
-            },
-            scopeInfo: meta?.scopes?.[scope] || null,
-            failedSources: meta?.failedSources || [],
-            discoveredSources: meta?.discoveredSources || [],
-          },
-          { headers: jsonHeaders() },
-        );
+      if (path === "/status") {
+        const head = await getHead(env);
+        const ready = await readReady(env, head);
+        return jsonResponse({
+          ok: Boolean(ready), scope,
+          sha: ready?.snapshot.sha || null,
+          generatedAt: ready?.snapshot.generatedAt || null,
+          checkedAt: head?.checkedAt || null,
+          nextCheckAt: head?.nextCheckAt ? new Date(head.nextCheckAt).toISOString() : null,
+          lastCheckResult: head?.lastCheckResult || null,
+          lastError: head?.lastError || null,
+          checkIntervalMinutes: 15,
+          uniqueProxies: ready?.snapshot.counts?.[scope] || 0,
+          sources: ready?.snapshot.sources || [],
+          fallback: ready?.fallback || false,
+        });
       }
-
-      if (url.pathname === "/refresh") {
-        const refresh = await refreshThroughLock(env, true);
-        return Response.json(refresh, { headers: jsonHeaders() });
-      }
-
-      const state = await ensureSubscription(env, scope, format);
-      const body = await env.SUBSCRIPTIONS_KV.get(subscriptionKey(scope, format));
-
-      if (body === null) {
-        throw new Error(`No cached ${scope}/${format} subscription is available`);
-      }
-
-      return new Response(body, {
-        headers: subscriptionHeaders({
-          "x-subscription-sha": state.meta?.sha || "unknown",
-          "x-subscription-cache": state.refresh?.action || "fresh",
+      const result = await ensureReady(env, path === "/refresh");
+      if (path === "/refresh") return jsonResponse({ ok: true, action: result.action, sha: result.snapshot.sha, generatedAt: result.snapshot.generatedAt });
+      return new Response(renderSubscription(result.snapshot, scope, format), {
+        headers: headers({
+          "x-subscription-sha": result.snapshot.sha,
+          "x-subscription-cache": result.action,
         }),
       });
     } catch (error) {
-      return new Response(`Upstream subscription error: ${normalizeError(error)}`, {
-        status: 502,
-        headers: subscriptionHeaders(),
-      });
+      return responseError(`Subscription unavailable: ${errorText(error)}`);
     }
   },
 };
