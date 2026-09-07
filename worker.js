@@ -56,9 +56,8 @@ function toBase64Utf8(text) {
   return btoa(binary);
 }
 
-// A profile's display name is not its connection identity. Keep the original
-// URI for the client, but compare its connection settings without the fragment.
-// Never collapse profiles merely because they share an IP, hostname or port.
+// Compare connection settings, not display names. Preserve the original URI
+// and never collapse profiles merely because they share a hostname or port.
 function stableJson(value) {
   if (Array.isArray(value)) return value.map(stableJson);
   if (value && typeof value === "object") {
@@ -81,8 +80,8 @@ function decodeBase64(value) {
 function canonicalUrl(uri) {
   const url = new URL(uri);
   if (!url.hostname) throw new Error("Missing proxy hostname");
-  // Preserve all transport, TLS, fingerprint, SNI, path and other settings.
-  // Only query-key ordering is normalized; repeated keys keep their order.
+  // Preserve transport, TLS, fingerprint, SNI, path and all other settings.
+  // Query-key ordering is normalized; repeated keys retain their order.
   const params = [...url.searchParams];
   params.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
   return [
@@ -107,7 +106,6 @@ function canonicalIdentity(uri) {
         const config = JSON.parse(decoded);
         if (config && typeof config === "object" && !Array.isArray(config)) {
           const connection = { ...config };
-          // These are display-only fields in standard VMess JSON subscriptions.
           for (const key of ["ps", "remarks", "remark", "name"]) delete connection[key];
           return `vmess-json:${JSON.stringify(stableJson(connection))}`;
         }
@@ -115,14 +113,13 @@ function canonicalIdentity(uri) {
     }
     if (scheme === "ss") {
       let normalized = uri;
-      // Legacy SS encodes the entire method:password@host:port authority.
       const authority = /^ss:\/\/([^/?#]+)(.*)$/i.exec(uri);
       if (authority && !authority[1].includes("@")) {
         const decoded = decodeBase64(authority[1]);
         if (decoded && decoded.includes("@")) normalized = `ss://${decoded}${authority[2]}`;
       }
       const parts = canonicalUrl(normalized);
-      // SIP002 may encode just the method:password userinfo in Base64.
+      // SIP002 may encode the method:password userinfo in Base64.
       if (!parts[2]) {
         const decoded = decodeBase64(parts[1]);
         if (decoded && decoded.includes(":")) {
@@ -131,7 +128,6 @@ function canonicalIdentity(uri) {
           parts[2] = decoded.slice(separator + 1);
         }
       }
-      // The cipher name is case-insensitive; the password is not.
       parts[1] = parts[1].toLowerCase();
       return `ss:${JSON.stringify(parts)}`;
     }
@@ -142,40 +138,49 @@ function canonicalIdentity(uri) {
     return `${scheme}:${uri.slice(match[0].length).split("#", 1)[0]}`;
   }
 }
-function aggregateProfiles(sources) {
+function deduplicateEntries(entries) {
   const profiles = new Map();
+  for (const [uri, mask] of entries) {
+    const key = canonicalIdentity(uri);
+    const existing = profiles.get(key);
+    if (existing) existing.mask |= mask;
+    else profiles.set(key, { uri, mask });
+  }
+  return [...profiles.values()].map(({ uri, mask }) => [uri, mask]);
+}
+function countProfiles(profiles) {
+  const counts = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
+  for (const [, mask] of profiles) {
+    for (let i = 0; i < SCOPES.length; i++) {
+      if (mask & (1 << i)) counts[SCOPES[i]]++;
+    }
+  }
+  return counts;
+}
+function aggregateProfiles(sources) {
+  const entries = [];
   const sourceStats = [];
-  let totalProfiles = 0;
   for (const { path, proxies } of sources) {
     let mask = 1;
     if (PATTERNS.black.test(path)) mask |= 2;
     if (PATTERNS["white-cidr"].test(path)) mask |= 4;
     if (PATTERNS["white-sni"].test(path)) mask |= 8;
     sourceStats.push({ path, count: proxies.length });
-    for (const uri of proxies) {
-      totalProfiles++;
-      const key = canonicalIdentity(uri);
-      const existing = profiles.get(key);
-      if (existing) {
-        existing.mask |= mask;
-      } else {
-        profiles.set(key, { uri, mask });
-      }
-    }
+    for (const uri of proxies) entries.push([uri, mask]);
   }
-  const counts = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
-  for (const profile of profiles.values()) {
-    for (let i = 0; i < SCOPES.length; i++) {
-      if (profile.mask & (1 << i)) counts[SCOPES[i]]++;
-    }
-  }
+  const profiles = deduplicateEntries(entries);
   return {
-    profiles: [...profiles.values()].map(({ uri, mask }) => [uri, mask]),
-    counts,
+    profiles,
+    counts: countProfiles(profiles),
     sourceStats,
-    totalProfiles,
-    duplicatesRemoved: totalProfiles - profiles.size,
+    totalProfiles: entries.length,
+    duplicatesRemoved: entries.length - profiles.length,
   };
+}
+function snapshotProfiles(snapshot) {
+  return snapshot.dedupVersion === DEDUP_VERSION
+    ? snapshot.profiles
+    : deduplicateEntries(snapshot.profiles);
 }
 
 async function githubJson(path, env) {
@@ -301,8 +306,6 @@ async function refresh(env, initialHead, force = false) {
     }
     const { snapshot, serialized } = await buildSnapshot(commit, env);
     const key = snapshotKey(commit.sha);
-    // Write the new version before switching the pointer. Old snapshots remain
-    // available for rollback; KV is eventually consistent, not transactional.
     await env.SUBSCRIPTIONS_KV.put(key, serialized);
     head = {
       schema: 3,
@@ -351,13 +354,8 @@ async function ensureReady(env, force = false) {
   }
 }
 function renderSubscription(snapshot, scope, format) {
-  // Also deduplicate legacy cached snapshots while their replacement is built.
-  const aggregate = snapshot.dedupVersion === DEDUP_VERSION
-    ? null
-    : aggregateProfiles([{ path: "BLACK_legacy.txt", proxies: snapshot.profiles.map((entry) => entry[0]) }]);
-  const profiles = aggregate ? aggregate.profiles.map((entry) => [entry[0], 1]) : snapshot.profiles;
   const bit = 1 << SCOPES.indexOf(scope);
-  const lines = profiles.filter((entry) => entry[1] & bit).map((entry) => entry[0]);
+  const lines = snapshotProfiles(snapshot).filter((entry) => entry[1] & bit).map((entry) => entry[0]);
   const body = `${lines.join("\n")}\n`;
   if (format === "base64") return toBase64Utf8(body);
   return [
@@ -417,7 +415,7 @@ export default {
           lastError: head?.lastError || null,
           checkIntervalMinutes: 15,
           dedupVersion: snapshot?.dedupVersion || 1,
-          uniqueProxies: snapshot?.counts?.[scope] || 0,
+          uniqueProxies: snapshot ? countProfiles(snapshotProfiles(snapshot))[scope] : 0,
           totalProfiles: snapshot?.totalProfiles || 0,
           duplicatesRemoved: snapshot?.duplicatesRemoved || 0,
           sources: snapshot?.sources || [],
