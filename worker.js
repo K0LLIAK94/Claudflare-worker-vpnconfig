@@ -123,6 +123,7 @@ async function buildSnapshot(commit, env) {
   const counts = Object.fromEntries(SCOPES.map((scope) => [scope, 0]));
   const sourceStats = [];
   for (const result of results) {
+    if (result.status !== "fulfilled") continue;
     const { path, proxies } = result.value;
     let mask = 1;
     if (PATTERNS.black.test(path)) mask |= 2;
